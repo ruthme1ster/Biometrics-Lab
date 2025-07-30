@@ -1,0 +1,77 @@
+# FINGERPRINT PROCESSING PIPELINE
+# Includes: Enhancement, Binarization, Skeletonization, Minutiae Detection
+
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.morphology import skeletonize
+
+# Load fingerprint image (grayscale)
+img = cv2.imread('fingerprint_white_ridges_cleaned (2).png', 0)
+
+# Step 1: Load grayscale fingerprint image
+img = cv2.imread('fingerprint_white_ridges_cleaned.png', 0)
+
+# Step 2: Resize for better visibility
+img = cv2.resize(img, (img.shape[1]*2, img.shape[0]*2), interpolation=cv2.INTER_LINEAR)
+
+# Step 3: CLAHE for contrast enhancement
+clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+enhanced = clahe.apply(img)
+
+# Step 4: Gaussian Blur to reduce noise
+blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+
+# Step 5: Binarize using Otsu's Thresholding
+_, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+binary = binary // 255  # Convert to 0/1
+
+# Step 6: Skeletonize
+skeleton = skeletonize(binary).astype(np.uint8) * 255
+cv2.imwrite('skeletonized.png', skeleton)
+
+# Step 7: Minutiae Detection using Crossing Number
+def crossing_number(P):
+    return sum(abs(P[i] - P[i+1]) for i in range(8)) // 2
+
+h, w = skeleton.shape
+endings = []
+bifurcations = []
+
+for y in range(1, h-1):
+    for x in range(1, w-1):
+        if skeleton[y, x] == 255:
+            P = [
+                skeleton[y-1, x]   // 255,
+                skeleton[y-1, x+1] // 255,
+                skeleton[y, x+1]   // 255,
+                skeleton[y+1, x+1] // 255,
+                skeleton[y+1, x]   // 255,
+                skeleton[y+1, x-1] // 255,
+                skeleton[y, x-1]   // 255,
+                skeleton[y-1, x-1] // 255,
+                skeleton[y-1, x]   // 255
+            ]
+            cn = crossing_number(P)
+            if cn == 1:
+                endings.append((x, y))
+            elif cn == 3:
+                bifurcations.append((x, y))
+
+# Step 8: Draw minutiae on color image
+color_skeleton = cv2.cvtColor(skeleton, cv2.COLOR_GRAY2BGR)
+
+for x, y in endings:
+    cv2.circle(color_skeleton, (x, y), 3, (0, 255, 255), -1)  # Yellow for ridge endings
+
+for x, y in bifurcations:
+    cv2.circle(color_skeleton, (x, y), 3, (255, 0, 255), -1)  # Magenta for bifurcations
+
+cv2.imwrite('minutiae_marked_bright_large.png', color_skeleton)
+
+# Step 9: Display final image
+plt.figure(figsize=(10, 8))
+plt.imshow(cv2.cvtColor(color_skeleton, cv2.COLOR_BGR2RGB))
+plt.title('Minutiae Marked (Yellow = Endings, Magenta = Bifurcations)')
+plt.axis('off')
+plt.show()
