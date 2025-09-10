@@ -1,0 +1,210 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+def detect_iris_direct(image_path, save_debug="/mnt/data/iris_detection_result.png"):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"Cannot open: {image_path}")
+    h0, w0 = img.shape[:2]
+
+    # 1) Crop out large black border (very important for screenshots)
+    gray0 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    nonblack = gray0 > 10                # tweak threshold if needed
+    ys, xs = np.nonzero(nonblack)
+    if len(xs) == 0:
+        crop = img.copy()
+        crop_off = (0,0)
+    else:
+        x1, x2 = max(0, xs.min()-2), min(w0-1, xs.max()+2)
+        y1, y2 = max(0, ys.min()-2), min(h0-1, ys.max()+2)
+        crop = img[y1:y2+1, x1:x2+1]
+        crop_off = (x1, y1)
+
+    h, w = crop.shape[:2]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    gray = clahe.apply(gray)
+    gray_blur = cv2.GaussianBlur(gray, (7,7), 0)
+
+    # 2) Robust pupil detection (Otsu + contour heuristics, avoid background)
+    _, th = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=2)
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise RuntimeError("No contours found during pupil detection.")
+
+    # analyze candidates and pick the best one by heuristics
+    candidates = []
+    cx_img, cy_img = w/2.0, h/2.0
+    for c in contours:
+        area = cv2.contourArea(c)
+        (x,y), r = cv2.minEnclosingCircle(c)
+        circ = area / (np.pi * (r**2) + 1e-8)
+        center_dist = np.hypot(x - cx_img, y - cy_img)
+        candidates.append((area, x, y, r, circ, center_dist, c))
+
+    # sort by area descending
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    # heuristics:
+    max_r_allowed = min(w,h) * 0.35         # pupil shouldn't be >35% of cropped min dimension
+    center_thresh = min(w,h) * 0.30         # pupillary center should be relatively central
+    chosen = None
+    for area, x, y, r, circ, center_dist, contour in candidates[:8]:
+        if area > 0.9*w*h:                   # skip huge background-like blobs
+            continue
+        if r < 4 or r > max_r_allowed:
+            continue
+        if circ < 0.20:                      # require some circularity
+            continue
+        if center_dist > center_thresh:
+            continue
+        chosen = (int(round(x)), int(round(y)), int(round(r)), contour)
+        break
+
+    # fallback: choose contour with smallest center distance that meets minimal criteria
+    if chosen is None:
+        best = None; best_cd = 1e9
+        for area, x, y, r, circ, center_dist, contour in candidates:
+            if r < 4 or r > min(w,h)*0.45:
+                continue
+            if circ < 0.15:
+                continue
+            if area > 0.95*w*h:
+                continue
+            if center_dist < best_cd:
+                best_cd = center_dist
+                best = (int(round(x)), int(round(y)), int(round(r)), contour)
+        if best is not None:
+            chosen = best
+
+    # final fallback: HoughCircles constrained
+    if chosen is None:
+        hc = cv2.HoughCircles(gray_blur, cv2.HOUGH_GRADIENT, dp=1.2, minDist=40,
+                              param1=60, param2=30, minRadius=3, maxRadius=int(min(w,h)*0.35))
+        if hc is not None:
+            hc = np.uint16(np.around(hc))
+            cx = int(hc[0][0][0]); cy = int(hc[0][0][1]); cr = int(hc[0][0][2])
+            chosen = (cx, cy, cr, None)
+
+    if chosen is None:
+        raise RuntimeError("Failed to detect pupil robustly. Try a better-centered/clear image.")
+
+    px, py, pr, pupil_contour = chosen
+    # Convert pupil coordinates back to original image later using crop_off
+
+    # 3) Iris detection: edge-based annulus + least-squares circle fit (Hough fallback)
+    edges = cv2.Canny(gray_blur, 40, 120)
+    yy, xx = np.nonzero(edges)
+    dx = xx - px
+    dy = yy - py
+    dists = np.sqrt(dx*dx + dy*dy)
+
+    inner_r = max(pr + 20, int(pr*1.05))
+    outer_r = int(min(max(pr*2.2, pr + 80), min(h,w)//2 - 5))
+    if outer_r <= inner_r + 5:
+        outer_r = int(min(h,w)//2 - 5)
+
+    ann_mask = (dists >= inner_r) & (dists <= outer_r)
+    pts = np.column_stack((xx[ann_mask], yy[ann_mask]))  # (x,y) points
+
+    # if too few points widen the search window
+    if len(pts) < 80:
+        inner_r = max(pr + 10, int(pr*1.0))
+        outer_r = int(min(min(h,w)//2 - 5, pr*3))
+        ann_mask = (dists >= inner_r) & (dists <= outer_r)
+        pts = np.column_stack((xx[ann_mask], yy[ann_mask]))
+
+    def fit_circle_ls_xy(pts_xy):
+        x = pts_xy[:,0].astype(np.float64)
+        y = pts_xy[:,1].astype(np.float64)
+        A = np.column_stack([2*x, 2*y, np.ones_like(x)])
+        b = x*x + y*y
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+        xc, yc, c = sol[0], sol[1], sol[2]
+        rad_sq = xc*xc + yc*yc + c
+        if rad_sq <= 0:
+            return None
+        r = np.sqrt(rad_sq)
+        return float(xc), float(yc), float(r)
+
+    iris_circle = None
+    if len(pts) >= 80:
+        fit = fit_circle_ls_xy(pts)
+        if fit is not None:
+            xc, yc, rr = fit
+            # sanity checks: radius range + center not too far away
+            if rr > inner_r-5 and rr < outer_r+50 and np.hypot(xc-px, yc-py) < rr*0.6:
+                iris_circle = (xc, yc, rr)
+
+    # fallback to Hough if LS failed
+    if iris_circle is None:
+        circles = cv2.HoughCircles(gray_blur, cv2.HOUGH_GRADIENT, dp=1.2, minDist=80,
+                                   param1=80, param2=30, minRadius=max(inner_r-10,5), maxRadius=outer_r+40)
+        if circles is not None:
+            circles = np.uint16(np.around(circles))
+            # pick circle closest to pupil center
+            best = None; bestd = 1e9
+            for c in circles[0]:
+                cx,cy,cr = int(c[0]), int(c[1]), int(c[2])
+                d = np.hypot(cx-px, cy-py)
+                if d < bestd:
+                    bestd = d; best = (float(cx), float(cy), float(cr))
+            if best:
+                iris_circle = best
+
+    if iris_circle is None:
+        raise RuntimeError("Iris detection failed. Try providing an image with less occlusion or allow eyelid masking.")
+
+    xc, yc, rr = iris_circle
+
+    # 4) Visualization (draw on cropped image, also save output by mapping back to original coordinates)
+    out = crop.copy()
+    cv2.circle(out, (px, py), pr, (0,255,0), 2)        # pupil - green
+    cv2.circle(out, (int(round(xc)), int(round(yc))), int(round(rr)), (0,0,255), 2)  # iris - red
+
+    # debugging views
+    annulus_img = np.zeros_like(edges)
+    cv2.circle(annulus_img, (px,py), inner_r, 255, -1)
+    cv2.circle(annulus_img, (px,py), outer_r, 0, -1)
+    annulus_edges = cv2.bitwise_and(edges, annulus_img)
+
+    overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    if len(pts) > 0:
+        sel = pts if len(pts) <= 500 else pts[np.random.choice(len(pts), 500, replace=False)]
+        for (x,y) in sel:
+            cv2.circle(overlay, (int(x), int(y)), 1, (0,255,255), -1)
+
+    # show figure
+    fig, axes = plt.subplots(1,3, figsize=(16,6))
+    axes[0].imshow(cv2.cvtColor(out, cv2.COLOR_BGR2RGB)); axes[0].set_title("Detected circles (cropped)"); axes[0].axis("off")
+    axes[1].imshow(edges, cmap="gray"); axes[1].set_title("Canny edges"); axes[1].axis("off")
+    axes[2].imshow(overlay[:,:,::-1]); axes[2].imshow(annulus_edges, cmap="hot", alpha=0.6); axes[2].set_title("Annulus edges & sample points"); axes[2].axis("off")
+    plt.tight_layout()
+    plt.show()
+
+    # Save a combined wide debug image mapped to the original canvas size for convenience
+    # Paste the 'out' back onto original-sized black canvas so circles align with original coordinates
+    canvas = np.zeros_like(img)
+    x_off, y_off = crop_off
+    canvas[y_off:y_off+h, x_off:x_off+w] = out
+    cv2.imwrite(save_debug, canvas)
+    print("Saved debug output to:", save_debug)
+    print(f"Pupil (cropped coords): x={px}, y={py}, r={pr}")
+    print(f"Iris  (cropped coords): xc={xc:.2f}, yc={yc:.2f}, r={rr:.2f}")
+    # Return coordinates in original image space
+    return {
+        "pupil": (px + crop_off[0], py + crop_off[1], pr),
+        "iris": (xc + crop_off[0], yc + crop_off[1], rr),
+        "debug_image": save_debug
+    }
+
+# Example usage:
+# replace the path with your image path if not using /mnt/data
+img_candidate = "iris_image2.png"  # adjust if different
+result = detect_iris_direct(img_candidate)
+print(result)
